@@ -1,42 +1,44 @@
 # gophercast
 
-A simple, modular publish-subscribe (pub/sub) system written in Go with zero external dependencies.
+A zero-dependency Go pub/sub library with in-process and TCP-networked modes.
 
 ## What is GopherCast?
 
-GopherCast is a pub/sub messaging system where:
+GopherCast routes messages from publishers to subscribers via a broker. Publishers and subscribers are decoupled — they don't need to know about each other.
 
-- **Publishers** send messages to topics.
-- **Subscribers** receive messages from topics they're 'subscribed' to.
-- **Brokers** manage the routing of messages from publishers to subscribers.
+```
+┌──────────────────────────────────────────┐
+│                 Broker                   │
+│  routes messages · manages subscriptions │
+└────────┬─────────────────────┬───────────┘
+         │                     │
+         ▼                     ▼
+  ┌─────────────┐       ┌─────────────┐
+  │  Publisher  │       │  Subscriber │
+  │ (sends msg) │       │ (recv msg)  │
+  └─────────────┘       └─────────────┘
+```
 
-Publishers and subscribers are decoupled; they don't need to know about each other.
+Both modes share the same broker API. Use the in-process broker when everything runs in one binary; use the TCP transport to connect separate processes.
 
 ## Features
 
-- Simple, clear code that is easily understood
 - Zero external dependencies (Go standard library only)
-- Modular design (each component can run independently)
-- Thread-safe (safe for concurrent use)
-- Non-blocking message delivery using goroutines
-- In-process only (no network transport)
+- In-process pub/sub with a thread-safe broker
+- TCP transport — run the broker as a standalone server, publish and subscribe from remote clients
+- Wildcard subscriptions (`*` single segment, `#` one-or-more trailing segments)
+- Message headers with first-class `correlation-id` support
+- Three delivery policies: `BestEffort` (drop-on-full), `DropOldest`, `Blocking`
+- At-least-once delivery via `AckedSubscription` with configurable timeout and retry limit
+- Context-based lifecycle — cancelling a context auto-unsubscribes
 
 ## Installation
-
-### go get
 
 ```bash
 go get github.com/gophercast/gophercast
 ```
-## git
 
-```bash
-git clone github.com/gophercast/gophercast
-```
-
-## Quick Start
-
-gophercast has a simple implementation you can easily build more features around:
+## Quick start — in-process
 
 ```go
 package main
@@ -54,205 +56,150 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    // Create broker
     b := broker.NewBroker()
     defer b.Close()
 
-    // Create topic
-    t, _ := topic.New("events")
+    t, _ := topic.New("events.created")
 
-    // Subscribe (cancelling ctx auto-unsubscribes)
     sub := b.Subscribe(ctx, t)
-
-    // Listen for messages
     go func() {
         for msg := range sub.MessageChannel() {
-            fmt.Println("Received:", msg.Data())
+            fmt.Println("received:", msg.Data())
         }
     }()
 
-    // Publish
-    delivered, dropped := b.Publish(ctx, message.NewMessage(t, "Hello, World!"))
+    delivered, dropped := b.Publish(ctx, message.NewMessage(t, "hello"))
     fmt.Printf("delivered=%d dropped=%d\n", delivered, dropped)
 }
 ```
 
-### Wildcard subscriptions
+## Quick start — networked (TCP)
 
-Patterns use `.` segment separators and support two wildcards:
+**Broker server** (`--addr` defaults to `:7650`):
 
-- `*` matches exactly one segment (`users.*` matches `users.created` but not `users.created.v2`).
-- `#` matches one or more trailing segments and may only appear last (`users.#` matches `users.created` and `users.created.v2`, but not `users`).
+```bash
+go run cmd/broker/main.go --addr :7650
+```
+
+**Subscriber** (connect to remote broker):
+
+```bash
+go run cmd/subscriber/main.go --broker localhost:7650
+```
+
+**Publisher** (connect to remote broker):
+
+```bash
+go run cmd/publisher/main.go --broker localhost:7650
+```
+
+Or connect from your own code:
 
 ```go
-pat, _ := topic.NewPattern("users.*")
+import "github.com/gophercast/gophercast/internal/transport"
+
+client, _ := transport.Dial(ctx, "localhost:7650")
+defer client.Close()
+
+t, _ := topic.New("events.created")
+
+sub, _ := client.Subscribe(ctx, t)
+go func() {
+    for msg := range sub.MessageChannel() {
+        fmt.Println("received:", msg.Data())
+    }
+}()
+
+client.Publish(ctx, message.NewMessage(t, "hello from afar"))
+```
+
+## Wildcard subscriptions
+
+Topic names use `.` as a segment separator. Two wildcards are supported in patterns:
+
+| Wildcard | Matches | Example pattern | Matches | Does not match |
+|----------|---------|-----------------|---------|----------------|
+| `*` | Exactly one segment | `users.*` | `users.created` | `users.created.v2`, `users` |
+| `#` | One or more trailing segments (must be last) | `users.#` | `users.created`, `users.created.v2` | `users` |
+
+```go
+pat, _ := topic.NewPattern("users.#")
 sub := b.SubscribePattern(ctx, pat)
 ```
 
-### Concepts:
-
-**Topic**: A named channel (e.g., "user.created", "order.placed").
-
-**Message**: Data being sent (includes topic, data, timestamp).
-
-**Subscription**: Registration to receive messages from a topic.
-
-**Broker**: Central hub that manages distribution.
-
-
-```
-┌─────────────────────────────────────────┐
-│              Broker                     │
-│  - Manages topics and subscriptions     │
-│  - Routes messages to subscribers       │
-└──────────┬────────────────┬─────────────┘
-           │                │
-           ▼                ▼
-    ┌─────────────┐   ┌─────────────┐
-    │ Publisher   │   │ Subscriber  │
-    │ (sends msg) │   │ (recv msg)  │
-    └─────────────┘   └─────────────┘
-```
-
-## Usage Examples
-
-### Example 1: Basic Pub/Sub
+The same API works with the TCP client:
 
 ```go
-package main
+pat, _ := topic.NewPattern("users.#")
+sub, _ := client.SubscribePattern(ctx, pat)
+```
 
-import (
-	"context"
-	"fmt"
-	"time"
+## Message headers
 
-	"github.com/gophercast/gophercast/internal/domain/broker"
-	"github.com/gophercast/gophercast/internal/domain/message"
-	"github.com/gophercast/gophercast/internal/domain/topic"
+```go
+msg := message.NewMessageWithHeaders(t, payload, map[string]string{
+    "correlation-id": "req-42",
+    "content-type":   "application/json",
+})
+
+// On the receiver:
+cid := msg.CorrelationID()          // "req-42"
+ct, ok := msg.Header("content-type")
+headers := msg.Headers()             // full copy of all headers
+```
+
+## Delivery policies
+
+Control what happens when a subscriber's buffer is full:
+
+```go
+import "github.com/gophercast/gophercast/internal/domain/subscription"
+
+// BestEffort (default) — drop the incoming message if buffer is full
+sub := b.Subscribe(ctx, t)
+
+// DropOldest — evict the oldest buffered message to make room
+sub := b.Subscribe(ctx, t, subscription.WithPolicy(subscription.DropOldest))
+
+// Blocking — block Publish until the subscriber drains a slot
+sub := b.Subscribe(ctx, t, subscription.WithPolicy(subscription.Blocking))
+
+// Custom buffer size (default is 200)
+sub := b.Subscribe(ctx, t, subscription.WithBufferSize(500))
+```
+
+## At-least-once delivery
+
+`AckedSubscription` wraps a subscription and redelivers messages that are not acknowledged within a timeout. Messages are delivered as `Envelope` values that carry an `Ack()` function.
+
+```go
+as := b.SubscribeAtLeastOnce(ctx, t,
+    subscription.WithAckTimeout(10*time.Second),
+    subscription.WithMaxRetries(5),   // 0 = unlimited
 )
 
-func main() {
-	fmt.Println("=== GopherCast System Example ===")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Step 1: Create broker
-	fmt.Println("1. Creating broker...")
-	b := broker.NewBroker()
-	defer b.Close()
-
-	// Step 2: Create topics
-	fmt.Println("2. Creating topics...")
-	usersTopic, _ := topic.New("users")
-	ordersTopic, _ := topic.New("orders")
-
-	// Step 3: Create subscribers (cancelling ctx auto-unsubscribes them)
-	fmt.Println("3. Creating subscribers...")
-
-	sub1 := b.Subscribe(ctx, usersTopic)
-
-	go func() {
-		fmt.Println("   [Subscriber 1] Listening to 'users' topic...")
-		for msg := range sub1.MessageChannel() {
-			fmt.Printf("   [Subscriber 1] Received: %s\n", msg.String())
-		}
-	}()
-
-	sub2 := b.Subscribe(ctx, usersTopic)
-
-	go func() {
-		fmt.Println("   [Subscriber 2] Listening to 'users' topic...")
-		for msg := range sub2.MessageChannel() {
-			fmt.Printf("   [Subscriber 2] Received: %s\n", msg.String())
-		}
-	}()
-
-	sub3 := b.Subscribe(ctx, ordersTopic)
-
-	go func() {
-		fmt.Println("   [Subscriber 3] Listening to 'orders' topic...")
-		for msg := range sub3.MessageChannel() {
-			fmt.Printf("   [Subscriber 3] Received: %s\n", msg.String())
-		}
-	}()
-
-	// Give subscribers time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Step 4: Publish messages
-	fmt.Println("\n4. Publishing messages...")
-
-	// Publish to users topic
-	fmt.Println("   Publishing to 'users' topic...")
-	b.Publish(ctx, message.NewMessage(usersTopic, "User Alice created"))
-
-	time.Sleep(100 * time.Millisecond)
-
-	b.Publish(ctx, message.NewMessage(usersTopic, "User Bob created"))
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Publish to orders topic
-	fmt.Println("\n   Publishing to 'orders' topic...")
-	b.Publish(ctx, message.NewMessage(ordersTopic, "Order #123 placed"))
-
-	// Wait for messages to be received
-	time.Sleep(500 * time.Millisecond)
-
-	fmt.Println("\n=== Example Complete ===")
-	fmt.Println("\nObservations:")
-	fmt.Println("- Subscribers 1 and 2 both received messages from 'users' topic")
-	fmt.Println("- Subscriber 3 only received messages from 'orders' topic")
-	fmt.Println("- Each subscriber got their own copy of the messages")
-}
+go func() {
+    for envelope := range as.EnvelopeChannel() {
+        process(envelope.Msg)
+        envelope.Ack() // prevent redelivery
+    }
+}()
 ```
 
-### Example 2: Multiple Topics
+Wildcard patterns are supported too:
 
 ```go
-ctx := context.Background()
-b := broker.NewBroker()
-
-userTopic, _ := topic.New("users")
-orderTopic, _ := topic.New("orders")
-
-userSub := b.Subscribe(ctx, userTopic)
-orderSub := b.Subscribe(ctx, orderTopic)
-
-// Publish to different topics
-b.Publish(ctx, message.NewMessage(userTopic, "User created"))
-b.Publish(ctx, message.NewMessage(orderTopic, "Order placed"))
+pat, _ := topic.NewPattern("orders.#")
+as := b.SubscribePatternAtLeastOnce(ctx, pat)
 ```
 
-### Example 3: Multiple Subscribers
+## Concepts
 
-```go
-ctx := context.Background()
-b := broker.NewBroker()
-t, _ := topic.New("events")
+| Term | Description |
+|------|-------------|
+| **Topic** | A named channel, e.g. `"users.created"`. Segments separated by `.`. |
+| **Pattern** | A topic matcher that may contain `*` or `#` wildcards. |
+| **Message** | An immutable value carrying a topic, payload, headers, ID, and timestamp. |
+| **Subscription** | A per-subscriber channel registered with the broker. |
+| **Broker** | The central hub that routes published messages to matching subscriptions. |
 
-// Multiple subscribers to same topic
-sub1 := b.Subscribe(ctx, t)
-sub2 := b.Subscribe(ctx, t)
-sub3 := b.Subscribe(ctx, t)
-
-// All three receive the same message
-b.Publish(ctx, message.NewMessage(t, "Event occurred"))
-```
-
-## Running Examples
-
-```bash
-# Run the complete example
-go run examples/basic/main.go
-
-# Run standalone broker
-go run cmd/broker/main.go
-
-# Run publisher example
-go run cmd/publisher/main.go
-
-# Run subscriber example
-go run cmd/subscriber/main.go
-```
