@@ -42,36 +42,53 @@ gophercast has a simple implementation you can easily build more features around
 package main
 
 import (
+    "context"
     "fmt"
+
     "github.com/gophercast/gophercast/internal/domain/broker"
     "github.com/gophercast/gophercast/internal/domain/message"
     "github.com/gophercast/gophercast/internal/domain/topic"
 )
 
 func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
     // Create broker
     b := broker.NewBroker()
     defer b.Close()
-    
+
     // Create topic
-    topic, _ := topic.New("events")
-    
-    // Subscribe
-    sub := b.Subscribe(topic)
-    defer b.Unsubscribe(sub.ID())
-    
+    t, _ := topic.New("events")
+
+    // Subscribe (cancelling ctx auto-unsubscribes)
+    sub := b.Subscribe(ctx, t)
+
     // Listen for messages
     go func() {
         for msg := range sub.MessageChannel() {
             fmt.Println("Received:", msg.Data())
         }
     }()
-    
+
     // Publish
-    msg := message.NewMessage(topic, "Hello, World!")
-    b.Publish(msg)
+    delivered, dropped := b.Publish(ctx, message.NewMessage(t, "Hello, World!"))
+    fmt.Printf("delivered=%d dropped=%d\n", delivered, dropped)
 }
 ```
+
+### Wildcard subscriptions
+
+Patterns use `.` segment separators and support two wildcards:
+
+- `*` matches exactly one segment (`users.*` matches `users.created` but not `users.created.v2`).
+- `#` matches one or more trailing segments and may only appear last (`users.#` matches `users.created` and `users.created.v2`, but not `users`).
+
+```go
+pat, _ := topic.NewPattern("users.*")
+sub := b.SubscribePattern(ctx, pat)
+```
+
 ### Concepts:
 
 **Topic**: A named channel (e.g., "user.created", "order.placed").
@@ -105,6 +122,7 @@ func main() {
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -116,6 +134,9 @@ import (
 func main() {
 	fmt.Println("=== GopherCast System Example ===")
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Step 1: Create broker
 	fmt.Println("1. Creating broker...")
 	b := broker.NewBroker()
@@ -126,12 +147,10 @@ func main() {
 	usersTopic, _ := topic.New("users")
 	ordersTopic, _ := topic.New("orders")
 
-	// Step 3: Create subscribers
+	// Step 3: Create subscribers (cancelling ctx auto-unsubscribes them)
 	fmt.Println("3. Creating subscribers...")
 
-	// Subscriber 1: Listens to users topic
-	sub1 := b.Subscribe(usersTopic)
-	defer b.Unsubscribe(sub1.ID())
+	sub1 := b.Subscribe(ctx, usersTopic)
 
 	go func() {
 		fmt.Println("   [Subscriber 1] Listening to 'users' topic...")
@@ -140,9 +159,7 @@ func main() {
 		}
 	}()
 
-	// Subscriber 2: Also listens to users topic
-	sub2 := b.Subscribe(usersTopic)
-	defer b.Unsubscribe(sub2.ID())
+	sub2 := b.Subscribe(ctx, usersTopic)
 
 	go func() {
 		fmt.Println("   [Subscriber 2] Listening to 'users' topic...")
@@ -151,9 +168,7 @@ func main() {
 		}
 	}()
 
-	// Subscriber 3: Listens to orders topic
-	sub3 := b.Subscribe(ordersTopic)
-	defer b.Unsubscribe(sub3.ID())
+	sub3 := b.Subscribe(ctx, ordersTopic)
 
 	go func() {
 		fmt.Println("   [Subscriber 3] Listening to 'orders' topic...")
@@ -170,20 +185,17 @@ func main() {
 
 	// Publish to users topic
 	fmt.Println("   Publishing to 'users' topic...")
-	msg1 := message.NewMessage(usersTopic, "User Alice created")
-	b.Publish(msg1)
+	b.Publish(ctx, message.NewMessage(usersTopic, "User Alice created"))
 
 	time.Sleep(100 * time.Millisecond)
 
-	msg2 := message.NewMessage(usersTopic, "User Bob created")
-	b.Publish(msg2)
+	b.Publish(ctx, message.NewMessage(usersTopic, "User Bob created"))
 
 	time.Sleep(100 * time.Millisecond)
 
 	// Publish to orders topic
 	fmt.Println("\n   Publishing to 'orders' topic...")
-	msg3 := message.NewMessage(ordersTopic, "Order #123 placed")
-	b.Publish(msg3)
+	b.Publish(ctx, message.NewMessage(ordersTopic, "Order #123 placed"))
 
 	// Wait for messages to be received
 	time.Sleep(500 * time.Millisecond)
@@ -199,32 +211,34 @@ func main() {
 ### Example 2: Multiple Topics
 
 ```go
+ctx := context.Background()
 b := broker.NewBroker()
 
 userTopic, _ := topic.New("users")
 orderTopic, _ := topic.New("orders")
 
-userSub := b.Subscribe(userTopic)
-orderSub := b.Subscribe(orderTopic)
+userSub := b.Subscribe(ctx, userTopic)
+orderSub := b.Subscribe(ctx, orderTopic)
 
 // Publish to different topics
-b.Publish(message.NewMessage(userTopic, "User created"))
-b.Publish(message.NewMessage(orderTopic, "Order placed"))
+b.Publish(ctx, message.NewMessage(userTopic, "User created"))
+b.Publish(ctx, message.NewMessage(orderTopic, "Order placed"))
 ```
 
 ### Example 3: Multiple Subscribers
 
 ```go
+ctx := context.Background()
 b := broker.NewBroker()
-topic, _ := topic.New("events")
+t, _ := topic.New("events")
 
 // Multiple subscribers to same topic
-sub1 := b.Subscribe(topic)
-sub2 := b.Subscribe(topic)
-sub3 := b.Subscribe(topic)
+sub1 := b.Subscribe(ctx, t)
+sub2 := b.Subscribe(ctx, t)
+sub3 := b.Subscribe(ctx, t)
 
 // All three receive the same message
-b.Publish(message.NewMessage(topic, "Event occurred"))
+b.Publish(ctx, message.NewMessage(t, "Event occurred"))
 ```
 
 ## Running Examples

@@ -1,50 +1,53 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"log"
 	"time"
 
-	"github.com/gophercast/gophercast/internal/domain/broker"
 	"github.com/gophercast/gophercast/internal/domain/message"
 	"github.com/gophercast/gophercast/internal/domain/topic"
+	"github.com/gophercast/gophercast/internal/transport"
 )
 
 func main() {
-	fmt.Println("Starting Publisher Example...")
+	brokerAddr := flag.String("broker", "localhost:7650", "broker address")
+	flag.Parse()
 
-	// Create broker (in real use, this would be shared)
-	b := broker.NewBroker()
-	defer b.Close()
+	ctx := context.Background()
 
-	// Create topic
+	client, err := transport.Dial(ctx, *brokerAddr)
+	if err != nil {
+		log.Fatalf("publisher: dial: %v", err)
+	}
+	defer client.Close()
+
 	usersTopic, err := topic.New("users.created")
 	if err != nil {
-		fmt.Printf("Error creating topic: %v\n", err)
-		return
+		log.Fatalf("publisher: topic: %v", err)
 	}
 
-	// Publish messages
-	fmt.Println("\nPublishing messages...")
+	fmt.Println("Publishing messages...")
 
 	for i := 1; i <= 5; i++ {
-		// Create message data
 		data := map[string]interface{}{
 			"user_id": fmt.Sprintf("user-%d", i),
 			"email":   fmt.Sprintf("user%d@example.com", i),
 		}
+		raw, _ := json.Marshal(data)
+		msg := message.NewMessage(usersTopic, json.RawMessage(raw))
 
-		// Create and publish message
-		msg := message.NewMessage(usersTopic, data)
-		b.Publish(msg)
-
-		fmt.Printf("Published: %s with data: %v\n", msg.String(), data)
-
-		// Wait a bit between messages
+		delivered, dropped, err := client.Publish(ctx, msg)
+		if err != nil {
+			log.Printf("publish error: %v", err)
+			continue
+		}
+		fmt.Printf("Published message %d (delivered=%d dropped=%d)\n", i, delivered, dropped)
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	fmt.Println("\nAll messages published!")
-
-	// Keep running for a bit to let subscribers receive
-	time.Sleep(2 * time.Second)
+	fmt.Println("All messages published!")
 }

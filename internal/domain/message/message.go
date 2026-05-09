@@ -15,6 +15,7 @@ type Message struct {
 	id          string
 	topic       topic.Topic
 	data        interface{}
+	headers     map[string]string
 	publishedAt time.Time
 }
 
@@ -25,7 +26,41 @@ func NewMessage(t topic.Topic, data interface{}) Message {
 		id:          generateMessageID(),
 		topic:       t,
 		data:        data,
+		headers:     make(map[string]string),
 		publishedAt: time.Now(),
+	}
+}
+
+// NewMessageWithHeaders creates a new message with the given headers in addition
+// to a generated ID and timestamp. headers may be nil.
+func NewMessageWithHeaders(t topic.Topic, data interface{}, headers map[string]string) Message {
+	h := make(map[string]string, len(headers))
+	for k, v := range headers {
+		h[k] = v
+	}
+	return Message{
+		id:          generateMessageID(),
+		topic:       t,
+		data:        data,
+		headers:     h,
+		publishedAt: time.Now(),
+	}
+}
+
+// Reconstruct rebuilds a Message from its constituent parts.
+// Intended for transport adapters that deserialise messages from the wire;
+// application code should use NewMessage or NewMessageWithHeaders.
+func Reconstruct(id string, t topic.Topic, data interface{}, headers map[string]string, publishedAt time.Time) Message {
+	h := make(map[string]string, len(headers))
+	for k, v := range headers {
+		h[k] = v
+	}
+	return Message{
+		id:          id,
+		topic:       t,
+		data:        data,
+		headers:     h,
+		publishedAt: publishedAt,
 	}
 }
 
@@ -42,6 +77,26 @@ func (m Message) Topic() topic.Topic {
 // Data returns the message payload.
 func (m Message) Data() interface{} {
 	return m.data
+}
+
+// Headers returns a copy of the message headers.
+func (m Message) Headers() map[string]string {
+	out := make(map[string]string, len(m.headers))
+	for k, v := range m.headers {
+		out[k] = v
+	}
+	return out
+}
+
+// Header returns the value of a single header and whether it was present.
+func (m Message) Header(key string) (string, bool) {
+	v, ok := m.headers[key]
+	return v, ok
+}
+
+// CorrelationID is a convenience accessor for the "correlation-id" header.
+func (m Message) CorrelationID() string {
+	return m.headers["correlation-id"]
 }
 
 // PublishedAt returns when the message was created.

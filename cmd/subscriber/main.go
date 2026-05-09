@@ -1,49 +1,53 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/gophercast/gophercast/internal/domain/broker"
 	"github.com/gophercast/gophercast/internal/domain/topic"
+	"github.com/gophercast/gophercast/internal/transport"
 )
 
 func main() {
-	fmt.Println("Starting Subscriber Example...")
+	brokerAddr := flag.String("broker", "localhost:7650", "broker address")
+	flag.Parse()
 
-	// Create broker (in real use, this would be shared)
-	b := broker.NewBroker()
-	defer b.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Create topic to subscribe to
+	client, err := transport.Dial(ctx, *brokerAddr)
+	if err != nil {
+		log.Fatalf("subscriber: dial: %v", err)
+	}
+	defer client.Close()
+
 	usersTopic, err := topic.New("users.created")
 	if err != nil {
-		fmt.Printf("Error creating topic: %v\n", err)
-		return
+		log.Fatalf("subscriber: topic: %v", err)
 	}
 
-	// Subscribe to topic
-	sub := b.Subscribe(usersTopic)
-	defer b.Unsubscribe(sub.ID())
+	sub, err := client.Subscribe(ctx, usersTopic)
+	if err != nil {
+		log.Fatalf("subscriber: subscribe: %v", err)
+	}
 
 	fmt.Printf("Subscribed to topic: %s\n", usersTopic.String())
 	fmt.Println("Waiting for messages... Press Ctrl+C to stop.")
 
-	// Set up graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// Listen for messages
 	go func() {
 		for msg := range sub.MessageChannel() {
-			fmt.Printf("\nReceived: %s\n", msg.String())
-			fmt.Printf("Data: %v\n", msg.Data())
+			fmt.Printf("Received on %s: data=%v\n", msg.Topic(), msg.Data())
 		}
 	}()
 
-	// Wait for shutdown signal
 	<-quit
 	fmt.Println("\nShutting down subscriber...")
 }

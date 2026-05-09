@@ -105,3 +105,65 @@ func TestTopicEquals(t *testing.T) {
 		})
 	}
 }
+
+func TestNewPattern(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"users", false},
+		{"users.created", false},
+		{"users.*", false},
+		{"users.#", false},
+		{"*.created", false},
+		{"users.*.v2", false},
+		{"", true},
+		{"users.", true},
+		{"users.#.v2", true}, // # not last
+		{"users.bad/seg", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			_, err := topic.NewPattern(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("NewPattern(%q) err=%v, wantErr=%v", tt.in, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPatternMatches(t *testing.T) {
+	tests := []struct {
+		pattern string
+		topic   string
+		want    bool
+	}{
+		{"users", "users", true},
+		{"users", "users.created", false},
+		{"users.*", "users.created", true},
+		{"users.*", "users.created.v2", false},
+		{"users.*", "users", false},
+		{"users.#", "users.created", true},
+		{"users.#", "users.created.v2", true},
+		{"users.#", "users", false},
+		{"users.#", "orders.created", false},
+		{"*.created", "users.created", true},
+		{"*.created", "orders.created", true},
+		{"*.created", "users.deleted", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern+"_vs_"+tt.topic, func(t *testing.T) {
+			p, err := topic.NewPattern(tt.pattern)
+			if err != nil {
+				t.Fatalf("NewPattern: %v", err)
+			}
+			tp, err := topic.New(tt.topic)
+			if err != nil {
+				t.Fatalf("New topic: %v", err)
+			}
+			if got := p.Matches(tp); got != tt.want {
+				t.Errorf("Matches=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}

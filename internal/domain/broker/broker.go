@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"sync"
 
 	"github.com/gophercast/gophercast/internal/domain/message"
@@ -8,78 +9,112 @@ import (
 	"github.com/gophercast/gophercast/internal/domain/topic"
 )
 
+// entry pairs a subscription with the pattern it was registered against.
+type entry struct {
+	pattern topic.Pattern
+	sub     *subscription.Subscription
+}
+
 // Broker is the central hub that manages topics and routes messages to subscribers.
 // It is safe for concurrent use by multiple goroutines.
+//
+// Delivery is governed per-subscription by the subscription.DeliveryPolicy.
+// Publishing never blocks for longer than required by the slowest Blocking subscriber.
 type Broker struct {
-	subscriptions map[string][]*subscription.Subscription // topic name -> subscriptions
-	mutex         sync.RWMutex
+	entries []entry
+	mutex   sync.RWMutex
 }
 
 // NewBroker creates a new message broker.
 func NewBroker() *Broker {
-	return &Broker{
-		subscriptions: make(map[string][]*subscription.Subscription),
-	}
+	return &Broker{}
 }
 
-// Subscribe creates a new subscription for the given topic.
-// Returns the subscription which includes a channel for receiving messages.
-func (b *Broker) Subscribe(t topic.Topic) *subscription.Subscription {
+// Subscribe registers an exact-match subscription for the given topic.
+// When ctx is cancelled the subscription is automatically removed and closed.
+// Pass context.Background() for a subscription with no automatic teardown.
+func (b *Broker) Subscribe(ctx context.Context, t topic.Topic, opts ...subscription.Option) *subscription.Subscription {
+	return b.SubscribePattern(ctx, t.AsPattern(), opts...)
+}
+
+// SubscribePattern registers a subscription that receives every message whose
+// topic matches p. See topic.Pattern for the supported wildcard syntax.
+func (b *Broker) SubscribePattern(ctx context.Context, p topic.Pattern, opts ...subscription.Option) *subscription.Subscription {
+	sub := subscription.NewSubscription(topic.FromString(p.String()), opts...)
+
 	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.entries = append(b.entries, entry{pattern: p, sub: sub})
+	b.mutex.Unlock()
 
-	sub := subscription.NewSubscription(t)
-	topicName := t.String()
-
-	b.subscriptions[topicName] = append(b.subscriptions[topicName], sub)
-
+	if ctx != nil && ctx.Done() != nil {
+		go func() {
+			<-ctx.Done()
+			b.Unsubscribe(sub.ID())
+		}()
+	}
 	return sub
 }
 
-// Unsubscribe removes a subscription from the broker.
-// The subscription will no longer receive messages.
+// SubscribeAtLeastOnce registers an exact-match subscription with at-least-once
+// delivery semantics. Messages are redelivered via the returned
+// AckedSubscription.EnvelopeChannel() until acknowledged or max retries reached.
+func (b *Broker) SubscribeAtLeastOnce(ctx context.Context, t topic.Topic, opts ...subscription.AckOption) *subscription.AckedSubscription {
+	return b.SubscribePatternAtLeastOnce(ctx, t.AsPattern(), opts...)
+}
+
+// SubscribePatternAtLeastOnce is the wildcard variant of SubscribeAtLeastOnce.
+func (b *Broker) SubscribePatternAtLeastOnce(ctx context.Context, p topic.Pattern, opts ...subscription.AckOption) *subscription.AckedSubscription {
+	// Use a small buffer; AckedSubscription drains it promptly.
+	inner := b.SubscribePattern(ctx, p, subscription.WithBufferSize(500))
+	return subscription.NewAckedSubscription(inner, opts...)
+}
+
+// Unsubscribe removes a subscription from the broker and closes its channel.
+// Calling Unsubscribe with an unknown id is a no-op.
 func (b *Broker) Unsubscribe(subscriptionID string) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	// Find and remove the subscription from all topics
-	for topicName, subs := range b.subscriptions {
-		for i, sub := range subs {
-			if sub.ID() == subscriptionID {
-				// Close the subscription
-				sub.Close()
-
-				// Remove from slice
-				b.subscriptions[topicName] = append(subs[:i], subs[i+1:]...)
-
-				// If no more subscriptions for this topic, remove the topic
-				if len(b.subscriptions[topicName]) == 0 {
-					delete(b.subscriptions, topicName)
-				}
-
-				return
-			}
+	for i, e := range b.entries {
+		if e.sub.ID() == subscriptionID {
+			e.sub.Close()
+			b.entries = append(b.entries[:i], b.entries[i+1:]...)
+			return
 		}
 	}
 }
 
-// Publish sends a message to all subscribers of the message's topic.
-// Distribution is done concurrently using goroutines to avoid blocking.
-// Messages sent to topics with no subscribers are dropped.
-func (b *Broker) Publish(msg message.Message) {
+// Publish offers msg to every subscription whose pattern matches msg.Topic().
+// It returns how many subscribers accepted the message and how many dropped it
+// (because their buffer was full or they were closed). Publish honours ctx
+// only insofar as a cancelled ctx causes it to return (0, 0) without
+// delivering; it never blocks on subscriber buffers.
+func (b *Broker) Publish(ctx context.Context, msg message.Message) (delivered, dropped int) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return 0, 0
+		default:
+		}
+	}
+
 	b.mutex.RLock()
-	subs := b.subscriptions[msg.Topic().String()]
+	matched := make([]*subscription.Subscription, 0, len(b.entries))
+	for _, e := range b.entries {
+		if e.pattern.Matches(msg.Topic()) {
+			matched = append(matched, e.sub)
+		}
+	}
 	b.mutex.RUnlock()
 
-	// If no subscribers, message is dropped
-	if len(subs) == 0 {
-		return
+	for _, s := range matched {
+		if s.SendMessage(msg) {
+			delivered++
+		} else {
+			dropped++
+		}
 	}
-
-	// Send to all subscribers concurrently
-	for _, sub := range subs {
-		go sub.SendMessage(msg)
-	}
+	return delivered, dropped
 }
 
 // Close closes all subscriptions and shuts down the broker.
@@ -88,13 +123,8 @@ func (b *Broker) Close() {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	// Close all subscriptions
-	for _, subs := range b.subscriptions {
-		for _, sub := range subs {
-			sub.Close()
-		}
+	for _, e := range b.entries {
+		e.sub.Close()
 	}
-
-	// Clear the subscriptions map
-	b.subscriptions = make(map[string][]*subscription.Subscription)
+	b.entries = nil
 }

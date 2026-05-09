@@ -124,3 +124,70 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+func TestNewMessageWithHeaders(t *testing.T) {
+	tp, _ := topic.New("events")
+	headers := map[string]string{
+		"correlation-id": "req-123",
+		"content-type":   "application/json",
+	}
+	msg := message.NewMessageWithHeaders(tp, "payload", headers)
+
+	if v, ok := msg.Header("correlation-id"); !ok || v != "req-123" {
+		t.Errorf("Header correlation-id = %q ok=%v, want %q true", v, ok, "req-123")
+	}
+	if v, ok := msg.Header("content-type"); !ok || v != "application/json" {
+		t.Errorf("Header content-type = %q, want application/json", v)
+	}
+	if _, ok := msg.Header("missing"); ok {
+		t.Error("Missing header should not be present")
+	}
+
+	if got := msg.CorrelationID(); got != "req-123" {
+		t.Errorf("CorrelationID = %q, want req-123", got)
+	}
+
+	// Headers() must return a copy.
+	h := msg.Headers()
+	h["correlation-id"] = "mutated"
+	if msg.CorrelationID() != "req-123" {
+		t.Error("Mutating returned headers must not affect the message")
+	}
+}
+
+func TestNewMessageHeadersIsolated(t *testing.T) {
+	tp, _ := topic.New("events")
+	original := map[string]string{"k": "v"}
+	msg := message.NewMessageWithHeaders(tp, nil, original)
+
+	// Mutate the original map; the message must be unaffected.
+	original["k"] = "mutated"
+	if v, _ := msg.Header("k"); v != "v" {
+		t.Errorf("Header was mutated by caller; got %q, want v", v)
+	}
+}
+
+func TestReconstruct(t *testing.T) {
+	tp, _ := topic.New("events")
+	now := time.Now().Truncate(time.Second)
+	msg := message.Reconstruct("fixed-id", tp, "data", map[string]string{"k": "v"}, now)
+
+	if msg.ID() != "fixed-id" {
+		t.Errorf("ID = %q, want fixed-id", msg.ID())
+	}
+	if !msg.PublishedAt().Equal(now) {
+		t.Errorf("PublishedAt = %v, want %v", msg.PublishedAt(), now)
+	}
+	if v, _ := msg.Header("k"); v != "v" {
+		t.Errorf("Header k = %q, want v", v)
+	}
+}
+
+func TestNewMessageDefaultHeaders(t *testing.T) {
+	tp, _ := topic.New("events")
+	msg := message.NewMessage(tp, nil)
+	h := msg.Headers()
+	if h == nil {
+		t.Error("Headers() should not return nil for a message created via NewMessage")
+	}
+}
